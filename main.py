@@ -89,6 +89,55 @@ def to_plain_data(payload: Any) -> Any:
     return str(payload)
 
 
+def to_int_or_none(value: Any) -> int | None:
+    if value is None:
+        return None
+
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def to_float_or_none(value: Any) -> float | None:
+    if value is None:
+        return None
+
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def get_plug_label(plug_status: Any) -> str | None:
+    normalized = to_int_or_none(plug_status)
+
+    labels = {
+        0: "Desenchufado",
+        1: "Enchufado",
+    }
+
+    if normalized in labels:
+        return labels[normalized]
+
+    return str(plug_status) if plug_status is not None else None
+
+
+def get_charging_label(charging_status: Any) -> str | None:
+    normalized = to_float_or_none(charging_status)
+
+    labels = {
+        0.0: "No cargando",
+        1.0: "Cargando",
+        -1.0: "Error",
+    }
+
+    if normalized in labels:
+        return labels[normalized]
+
+    return str(charging_status) if charging_status is not None else None
+
+
 async def create_client():
     if not MYRENAULT_EMAIL or not MYRENAULT_PASSWORD:
         raise HTTPException(
@@ -244,6 +293,26 @@ async def fetch_renault_status() -> dict[str, Any]:
             or get_attr(battery_plain, "battery_autonomy")
         )
 
+        plug_status = (
+            get_attr(battery_plain, "plugStatus")
+            or get_attr(battery_plain, "plug_status")
+        )
+
+        charging_status = (
+            get_attr(battery_plain, "chargingStatus")
+            or get_attr(battery_plain, "charging_status")
+        )
+
+        charging_remaining_time = (
+            get_attr(battery_plain, "chargingRemainingTime")
+            or get_attr(battery_plain, "charging_remaining_time")
+        )
+
+        charging_remaining_time_last_update = (
+            get_attr(battery_plain, "chargingRemainingTimeLastUpdateDateTime")
+            or get_attr(battery_plain, "charging_remaining_time_last_update_date_time")
+        )
+
         updated_at = (
             get_attr(battery_plain, "timestamp")
             or get_attr(cockpit_plain, "timestamp")
@@ -256,10 +325,23 @@ async def fetch_renault_status() -> dict[str, Any]:
             or get_attr(cockpit_plain, "odometer")
         )
 
+        soc_int = to_int_or_none(soc)
+        range_int = to_int_or_none(range_km)
+        odometer_int = to_int_or_none(odometer_km)
+        plug_int = to_int_or_none(plug_status)
+        charging_float = to_float_or_none(charging_status)
+        charging_remaining_int = to_int_or_none(charging_remaining_time)
+
         return {
-            "soc": soc,
-            "rangeKm": range_km,
-            "odometerKm": odometer_km,
+            "soc": soc_int,
+            "rangeKm": range_int,
+            "odometerKm": odometer_int,
+            "plugStatus": plug_int,
+            "plugLabel": get_plug_label(plug_status),
+            "chargingStatus": charging_float,
+            "chargingLabel": get_charging_label(charging_status),
+            "chargingRemainingTime": charging_remaining_int,
+            "chargingRemainingTimeLastUpdate": charging_remaining_time_last_update,
             "updatedAt": updated_at,
             "source": "myrenault",
             "accountId": account_id,
@@ -302,6 +384,58 @@ async def debug_vehicles(x_app_secret: str | None = Header(default=None)):
         return {
             "accountId": account_id,
             "vehicles": to_plain_data(vehicles_response),
+        }
+    finally:
+        await websession.close()
+
+
+@app.get("/debug/endpoints")
+async def debug_endpoints(x_app_secret: str | None = Header(default=None)):
+    require_secret(x_app_secret)
+
+    vehicle, account_id, vin, websession = await get_renault_vehicle()
+
+    results = {}
+
+    endpoint_methods = [
+        "get_battery_status",
+        "get_cockpit",
+        "get_charge_mode",
+        "get_charging_settings",
+        "get_charge_schedule",
+        "get_location",
+        "get_hvac_status",
+    ]
+
+    try:
+        for method_name in endpoint_methods:
+            method = getattr(vehicle, method_name, None)
+
+            if method is None:
+                results[method_name] = {
+                    "available": False,
+                    "error": "Método no disponible en renault-api"
+                }
+                continue
+
+            try:
+                response = await method()
+                results[method_name] = {
+                    "available": True,
+                    "ok": True,
+                    "data": to_plain_data(response)
+                }
+            except Exception as exc:
+                results[method_name] = {
+                    "available": True,
+                    "ok": False,
+                    "error": str(exc)
+                }
+
+        return {
+            "accountId": account_id,
+            "vin": vin,
+            "results": results,
         }
     finally:
         await websession.close()
