@@ -128,30 +128,49 @@ async def get_renault_vehicle():
         account = await client.get_api_account(account_id)
 
         if not vin:
-            vehicles = await account.get_vehicles()
+    vehicles_response = await account.get_vehicles()
+    vehicles_plain = to_plain_data(vehicles_response)
 
-            if not vehicles:
-                raise HTTPException(
-                    status_code=500,
-                    detail="No se han encontrado vehículos en la cuenta MyRenault."
-                )
+    vehicle_links = (
+        get_attr(vehicles_response, "vehicleLinks")
+        or get_attr(vehicles_response, "vehicle_links")
+        or get_attr(vehicles_plain, "vehicleLinks")
+        or get_attr(vehicles_plain, "vehicle_links")
+        or []
+    )
 
-            first_vehicle = vehicles[0]
-            vin = (
-                get_attr(first_vehicle, "vin")
-                or get_attr(first_vehicle, "vehicleDetails", {}).get("vin")
-                if isinstance(get_attr(first_vehicle, "vehicleDetails", {}), dict)
-                else None
-            )
+    if not vehicle_links:
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "message": "No se han encontrado vehículos en la cuenta MyRenault.",
+                "vehicles": vehicles_plain,
+            }
+        )
 
-            if not vin:
-                raise HTTPException(
-                    status_code=500,
-                    detail={
-                        "message": "No se pudo detectar VIN automáticamente.",
-                        "vehicles": to_plain_data(vehicles),
-                    }
-                )
+    first_vehicle = vehicle_links[0]
+
+    vehicle_details = (
+        get_attr(first_vehicle, "vehicleDetails")
+        or get_attr(first_vehicle, "vehicle_details")
+        or {}
+    )
+
+    vin = (
+        get_attr(first_vehicle, "vin")
+        or get_attr(first_vehicle, "vehicleId")
+        or get_attr(first_vehicle, "vehicle_id")
+        or get_attr(vehicle_details, "vin")
+    )
+
+    if not vin:
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "message": "No se pudo detectar VIN automáticamente.",
+                "vehicles": vehicles_plain,
+            }
+        )
 
         vehicle = await account.get_api_vehicle(vin)
         return vehicle, account_id, vin
