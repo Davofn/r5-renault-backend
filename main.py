@@ -12,6 +12,10 @@ app = FastAPI(title="R5 Renault Backend")
 ALLOWED_ORIGIN = os.getenv("ALLOWED_ORIGIN", "*")
 APP_SHARED_SECRET = os.getenv("APP_SHARED_SECRET", "")
 
+SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
+SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY", "")
+ALLOWED_SUPABASE_USER_ID = os.getenv("ALLOWED_SUPABASE_USER_ID", "")
+
 MYRENAULT_EMAIL = os.getenv("MYRENAULT_EMAIL", "")
 MYRENAULT_PASSWORD = os.getenv("MYRENAULT_PASSWORD", "")
 MYRENAULT_LOCALE = os.getenv("MYRENAULT_LOCALE", "es_ES")
@@ -37,6 +41,50 @@ app.add_middleware(
 def require_secret(x_app_secret: str | None) -> None:
     if APP_SHARED_SECRET and x_app_secret != APP_SHARED_SECRET:
         raise HTTPException(status_code=401, detail="Unauthorized")
+
+
+async def validate_supabase_token(authorization: str | None) -> dict[str, Any]:
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing Supabase token")
+
+    if not SUPABASE_URL or not SUPABASE_ANON_KEY:
+        raise HTTPException(
+            status_code=500,
+            detail="Faltan SUPABASE_URL o SUPABASE_ANON_KEY en Render."
+        )
+
+    token = authorization.replace("Bearer ", "", 1).strip()
+
+    async with aiohttp.ClientSession() as session:
+        async with session.get(
+            f"{SUPABASE_URL}/auth/v1/user",
+            headers={
+                "apikey": SUPABASE_ANON_KEY,
+                "Authorization": f"Bearer {token}",
+            },
+            timeout=15,
+        ) as response:
+            if response.status != 200:
+                raise HTTPException(status_code=401, detail="Invalid Supabase token")
+
+            user = await response.json()
+
+    user_id = user.get("id")
+
+    if ALLOWED_SUPABASE_USER_ID and user_id != ALLOWED_SUPABASE_USER_ID:
+        raise HTTPException(status_code=403, detail="User not allowed")
+
+    return user
+
+
+async def require_user_or_secret(
+    authorization: str | None,
+    x_app_secret: str | None,
+) -> dict[str, Any] | None:
+    if APP_SHARED_SECRET and x_app_secret == APP_SHARED_SECRET:
+        return None
+
+    return await validate_supabase_token(authorization)
 
 
 def get_attr(payload: Any, key: str, default: Any = None) -> Any:
@@ -266,19 +314,8 @@ async def fetch_renault_status() -> dict[str, Any]:
     vehicle, account_id, vin, websession = await get_renault_vehicle()
 
     try:
-        try:
-            battery_status = await vehicle.get_battery_status()
-        except Exception as exc:
-            battery_status = {
-                "error": f"No se pudo leer battery_status: {exc}"
-            }
-
-        try:
-            cockpit = await vehicle.get_cockpit()
-        except Exception as exc:
-            cockpit = {
-                "error": f"No se pudo leer cockpit: {exc}"
-            }
+        battery_status = await vehicle.get_battery_status()
+        cockpit = await vehicle.get_cockpit()
 
         battery_plain = to_plain_data(battery_status)
         cockpit_plain = to_plain_data(cockpit)
@@ -306,11 +343,6 @@ async def fetch_renault_status() -> dict[str, Any]:
         charging_remaining_time = (
             get_attr(battery_plain, "chargingRemainingTime")
             or get_attr(battery_plain, "charging_remaining_time")
-        )
-
-        charging_remaining_time_last_update = (
-            get_attr(battery_plain, "chargingRemainingTimeLastUpdateDateTime")
-            or get_attr(battery_plain, "charging_remaining_time_last_update_date_time")
         )
 
         updated_at = (
@@ -341,15 +373,8 @@ async def fetch_renault_status() -> dict[str, Any]:
             "chargingStatus": charging_float,
             "chargingLabel": get_charging_label(charging_status),
             "chargingRemainingTime": charging_remaining_int,
-            "chargingRemainingTimeLastUpdate": charging_remaining_time_last_update,
             "updatedAt": updated_at,
             "source": "myrenault",
-            "accountId": account_id,
-            "vin": vin,
-            "raw": {
-                "batteryStatus": battery_plain,
-                "cockpit": cockpit_plain,
-            },
         }
     finally:
         await websession.close()
@@ -443,10 +468,11 @@ async def debug_endpoints(x_app_secret: str | None = Header(default=None)):
 
 @app.get("/renault/status")
 async def renault_status(
+    authorization: str | None = Header(default=None),
     x_app_secret: str | None = Header(default=None),
     refresh: bool = False,
 ):
-    require_secret(x_app_secret)
+    await require_user_or_secret(authorization, x_app_secret)
 
     now = time.time()
 
