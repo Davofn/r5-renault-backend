@@ -40,11 +40,8 @@ def require_secret(x_app_secret: str | None) -> None:
 
 
 def get_attr(payload: Any, key: str, default: Any = None) -> Any:
-    """
-    Soporta respuestas tipo dict y objetos pydantic/dataclass.
-    """
     if payload is None:
-      return default
+        return default
 
     if isinstance(payload, dict):
         if key in payload:
@@ -56,6 +53,9 @@ def get_attr(payload: Any, key: str, default: Any = None) -> Any:
 
         data = payload.get("data")
         if isinstance(data, dict):
+            if key in data:
+                return data.get(key)
+
             data_attributes = data.get("attributes")
             if isinstance(data_attributes, dict) and key in data_attributes:
                 return data_attributes.get(key)
@@ -64,14 +64,14 @@ def get_attr(payload: Any, key: str, default: Any = None) -> Any:
 
 
 def to_plain_data(payload: Any) -> Any:
-    """
-    Convierte objetos de renault-api a algo serializable si es posible.
-    """
     if payload is None:
         return None
 
     if isinstance(payload, dict):
         return payload
+
+    if isinstance(payload, list):
+        return [to_plain_data(item) for item in payload]
 
     if hasattr(payload, "model_dump"):
         return payload.model_dump()
@@ -80,54 +80,76 @@ def to_plain_data(payload: Any) -> Any:
         return payload.dict()
 
     if hasattr(payload, "__dict__"):
-        return payload.__dict__
+        return {
+            key: to_plain_data(value)
+            for key, value in payload.__dict__.items()
+            if not key.startswith("_")
+        }
 
     return str(payload)
 
 
-async def get_renault_vehicle():
+async def create_client():
     if not MYRENAULT_EMAIL or not MYRENAULT_PASSWORD:
         raise HTTPException(
             status_code=500,
             detail="Faltan MYRENAULT_EMAIL o MYRENAULT_PASSWORD en Render."
         )
 
-    async with aiohttp.ClientSession() as websession:
-        client = RenaultClient(websession=websession, locale=MYRENAULT_LOCALE)
-        await client.session.login(MYRENAULT_EMAIL, MYRENAULT_PASSWORD)
+    websession = aiohttp.ClientSession()
+    client = RenaultClient(websession=websession, locale=MYRENAULT_LOCALE)
+    await client.session.login(MYRENAULT_EMAIL, MYRENAULT_PASSWORD)
 
-        account_id = MYRENAULT_ACCOUNT_ID
-        vin = MYRENAULT_VIN
+    return client, websession
 
-        if not account_id:
-            person = await client.get_person()
-            accounts = get_attr(person, "accounts", [])
 
-            if not accounts:
-                raise HTTPException(
-                    status_code=500,
-                    detail="No se han encontrado cuentas MyRenault."
-                )
+async def detect_account_id(client: RenaultClient) -> str:
+    if MYRENAULT_ACCOUNT_ID:
+        return MYRENAULT_ACCOUNT_ID
 
-            first_account = accounts[0]
-            account_id = (
-                get_attr(first_account, "accountId")
-                or get_attr(first_account, "account_id")
-                or get_attr(first_account, "kamereonAccountId")
-            )
+    person = await client.get_person()
+    person_plain = to_plain_data(person)
 
-            if not account_id:
-                raise HTTPException(
-                    status_code=500,
-                    detail={
-                        "message": "No se pudo detectar account_id automáticamente.",
-                        "person": to_plain_data(person),
-                    }
-                )
+    accounts = (
+        get_attr(person, "accounts")
+        or get_attr(person_plain, "accounts")
+        or []
+    )
 
-        account = await client.get_api_account(account_id)
+    if not accounts:
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "message": "No se han encontrado cuentas MyRenault.",
+                "person": person_plain,
+            }
+        )
 
-        if not vin:
+    first_account = accounts[0]
+
+    account_id = (
+        get_attr(first_account, "accountId")
+        or get_attr(first_account, "account_id")
+        or get_attr(first_account, "kamereonAccountId")
+        or get_attr(first_account, "kamereon_account_id")
+    )
+
+    if not account_id:
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "message": "No se pudo detectar account_id automáticamente.",
+                "person": person_plain,
+            }
+        )
+
+    return account_id
+
+
+async def detect_vin(account) -> str:
+    if MYRENAULT_VIN:
+        return MYRENAULT_VIN
+
     vehicles_response = await account.get_vehicles()
     vehicles_plain = to_plain_data(vehicles_response)
 
@@ -172,68 +194,83 @@ async def get_renault_vehicle():
             }
         )
 
+    return vin
+
+
+async def get_renault_vehicle():
+    client, websession = await create_client()
+
+    try:
+        account_id = await detect_account_id(client)
+        account = await client.get_api_account(account_id)
+
+        vin = await detect_vin(account)
         vehicle = await account.get_api_vehicle(vin)
-        return vehicle, account_id, vin
+
+        return vehicle, account_id, vin, websession
+    except Exception:
+        await websession.close()
+        raise
 
 
 async def fetch_renault_status() -> dict[str, Any]:
-    vehicle, account_id, vin = await get_renault_vehicle()
-
-    battery_status = None
-    cockpit = None
+    vehicle, account_id, vin, websession = await get_renault_vehicle()
 
     try:
-        battery_status = await vehicle.get_battery_status()
-    except Exception as exc:
-        battery_status = {
-            "error": f"No se pudo leer battery_status: {exc}"
+        try:
+            battery_status = await vehicle.get_battery_status()
+        except Exception as exc:
+            battery_status = {
+                "error": f"No se pudo leer battery_status: {exc}"
+            }
+
+        try:
+            cockpit = await vehicle.get_cockpit()
+        except Exception as exc:
+            cockpit = {
+                "error": f"No se pudo leer cockpit: {exc}"
+            }
+
+        battery_plain = to_plain_data(battery_status)
+        cockpit_plain = to_plain_data(cockpit)
+
+        soc = (
+            get_attr(battery_plain, "batteryLevel")
+            or get_attr(battery_plain, "battery_level")
+        )
+
+        range_km = (
+            get_attr(battery_plain, "batteryAutonomy")
+            or get_attr(battery_plain, "battery_autonomy")
+        )
+
+        updated_at = (
+            get_attr(battery_plain, "timestamp")
+            or get_attr(cockpit_plain, "timestamp")
+        )
+
+        odometer_km = (
+            get_attr(cockpit_plain, "totalMileage")
+            or get_attr(cockpit_plain, "total_mileage")
+            or get_attr(cockpit_plain, "mileage")
+            or get_attr(cockpit_plain, "odometer")
+        )
+
+        return {
+            "soc": soc,
+            "rangeKm": range_km,
+            "odometerKm": odometer_km,
+            "updatedAt": updated_at,
+            "source": "myrenault",
+            "accountId": account_id,
+            "vin": vin,
+            "raw": {
+                "batteryStatus": battery_plain,
+                "cockpit": cockpit_plain,
+            },
         }
-
-    try:
-        cockpit = await vehicle.get_cockpit()
-    except Exception as exc:
-        cockpit = {
-            "error": f"No se pudo leer cockpit: {exc}"
-        }
-
-    battery_plain = to_plain_data(battery_status)
-    cockpit_plain = to_plain_data(cockpit)
-
-    soc = (
-        get_attr(battery_plain, "batteryLevel")
-        or get_attr(battery_plain, "battery_level")
-    )
-
-    range_km = (
-        get_attr(battery_plain, "batteryAutonomy")
-        or get_attr(battery_plain, "battery_autonomy")
-    )
-
-    updated_at = (
-        get_attr(battery_plain, "timestamp")
-        or get_attr(cockpit_plain, "timestamp")
-    )
-
-    odometer_km = (
-        get_attr(cockpit_plain, "totalMileage")
-        or get_attr(cockpit_plain, "total_mileage")
-        or get_attr(cockpit_plain, "mileage")
-        or get_attr(cockpit_plain, "odometer")
-    )
-
-    return {
-        "soc": soc,
-        "rangeKm": range_km,
-        "odometerKm": odometer_km,
-        "updatedAt": updated_at,
-        "source": "myrenault",
-        "accountId": account_id,
-        "vin": vin,
-        "raw": {
-            "batteryStatus": battery_plain,
-            "cockpit": cockpit_plain,
-        },
-    }
+    finally:
+        await websession.close()
 
 
 @app.get("/")
@@ -249,6 +286,25 @@ def health():
     return {
         "ok": True
     }
+
+
+@app.get("/debug/vehicles")
+async def debug_vehicles(x_app_secret: str | None = Header(default=None)):
+    require_secret(x_app_secret)
+
+    client, websession = await create_client()
+
+    try:
+        account_id = await detect_account_id(client)
+        account = await client.get_api_account(account_id)
+        vehicles_response = await account.get_vehicles()
+
+        return {
+            "accountId": account_id,
+            "vehicles": to_plain_data(vehicles_response),
+        }
+    finally:
+        await websession.close()
 
 
 @app.get("/renault/status")
