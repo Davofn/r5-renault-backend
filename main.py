@@ -22,7 +22,7 @@ MYRENAULT_LOCALE = os.getenv("MYRENAULT_LOCALE", "es_ES")
 MYRENAULT_ACCOUNT_ID = os.getenv("MYRENAULT_ACCOUNT_ID", "")
 MYRENAULT_VIN = os.getenv("MYRENAULT_VIN", "")
 
-CACHE_SECONDS = int(os.getenv("CACHE_SECONDS", "600"))
+CACHE_SECONDS = int(os.getenv("CACHE_SECONDS", "300"))
 
 _status_cache: dict[str, Any] = {
     "timestamp": 0,
